@@ -9,17 +9,17 @@
 #include "Keypad.h"
 #include "Bluetooth.h"
 #include <U8g2lib.h>
+#include <ArduinoBLE.h>
+#include <ArduinoJson.h>
 
 // DEVICE CONFIGURATION
 #define DEVICE_NAME "URINE-TEST-001"
 #define DEVICE_VERSION "1.0"
 #define DEVICE_TYPE "Urinalysis Analyzer"
 
-// CUSTOM BLUETOOTH IDENTIFIER
-#define BT_IDENTIFIER "URINE-TEST-001-HC05"
-
 // INIT OLED
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
 
 void setup() {
   Serial.begin(9600);
@@ -37,18 +37,27 @@ void setup() {
   
   // Send device info via Bluetooth
   delay(500);
-  sendBluetoothMessage(BT_IDENTIFIER);  // Broadcast custom identifier
 }
 
 void loop() {
+  // Update BLE communication
+  bluetoothUpdate();
+  
+  // Check for received BLE data
+  if (hasNewData) {
+    JsonDocument receivedData = getReceivedJson();
+    Serial.println("Received BLE JSON:");
+    serializeJsonPretty(receivedData, Serial);
+    Serial.println();
+    hasNewData = false;
+  }
+  
   // Draw menu on OLED
   drawMenu(u8g2);
   
   // Scan keypad for input
   int key = scanKey();
   
-  // Handle Bluetooth communication
-  handleBluetooth();
 
   // Process keypad input
   switch (key) {
@@ -73,15 +82,20 @@ void loop() {
       case 15: { // SELECT
         Serial.print("Selected option: "); Serial.println(cursorPos);
 
-        String message = "Option " + String(cursorPos) + " selected";
-        sendBluetoothMessage(message.c_str());
-        // Handle menu selection logic here
+        // Example: Send test result via BLE as JSON
+        StaticJsonDocument<256> testResult;
+        testResult["type"] = "test_result";
+        testResult["device"] = DEVICE_NAME;
+        testResult["option"] = cursorPos;
+        testResult["timestamp"] = millis();
+        
+        sendJsonData(testResult);
+        
         break;
       }
 
       case 16: // BACK
         Serial.println("Back pressed");
-        sendBluetoothMessage("Back pressed");
         break;
         
       default:
