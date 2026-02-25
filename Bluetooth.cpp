@@ -1,121 +1,198 @@
 #include "Bluetooth.h"
 
 // ============================================
-// GLOBAL BLE VARIABLES
+// GLOBALS
 // ============================================
+
+BLESettings bleSettings;
 
 BLEService deviceInfoService(BLE_SERVICE_UUID);
 
-BLEStringCharacteristic manufacturerNameCharacteristic(DEVICE_INFO_CHAR_UUID, BLERead, 20);
-BLEStringCharacteristic modelNumberCharacteristic(DEVICE_MODEL_CHAR_UUID, BLERead, 20);
+BLEStringCharacteristic manufacturerNameCharacteristic(DEVICE_INFO_CHAR_UUID,  BLERead,   BLE_NAME_MAX_LEN);
+BLEStringCharacteristic modelNumberCharacteristic     (DEVICE_MODEL_CHAR_UUID, BLERead,   BLE_NAME_MAX_LEN);
+BLEStringCharacteristic dataTxCharacteristic          (DATA_TX_CHAR_UUID,      BLENotify, JSON_BUFFER_SIZE);
+BLEStringCharacteristic dataRxCharacteristic          (DATA_RX_CHAR_UUID,      BLEWrite,  JSON_BUFFER_SIZE);
 
-// Data transmission characteristic (device -> phone)
-BLEStringCharacteristic dataTxCharacteristic(DATA_TX_CHAR_UUID, BLENotify, JSON_BUFFER_SIZE);
-
-// Data reception characteristic (phone -> device)
-BLEStringCharacteristic dataRxCharacteristic(DATA_RX_CHAR_UUID, BLEWrite, JSON_BUFFER_SIZE);
-
-// Last received JSON data
 StaticJsonDocument<JSON_BUFFER_SIZE> lastReceivedJson;
 bool hasNewData = false;
 
 // ============================================
 // FORWARD DECLARATIONS
 // ============================================
+
 void onDataReceived(BLEDevice central, BLECharacteristic characteristic);
 
 // ============================================
-// FUNCTION IMPLEMENTATIONS
+// SETTINGS MANAGEMENT
+// ============================================
+
+bool bleLoadSettings() {
+  EEPROM.get(BLE_EEPROM_ADDR, bleSettings);
+  if (bleSettings.magic != BLE_EEPROM_MAGIC) {
+    bleResetToDefaults();
+    return false;
+  }
+  return true;
+}
+
+void bleSaveSettings() {
+  bleSettings.magic = BLE_EEPROM_MAGIC;
+  EEPROM.put(BLE_EEPROM_ADDR, bleSettings);
+  Serial.println("[BLE] Settings saved to EEPROM.");
+  blePrintSettings();
+}
+
+void bleResetToDefaults() {
+  bleSettings.magic = BLE_EEPROM_MAGIC;
+  strncpy(bleSettings.localName,    BLE_DEFAULT_NAME,         BLE_NAME_MAX_LEN - 1);
+  strncpy(bleSettings.manufacturer, BLE_DEFAULT_MANUFACTURER, BLE_NAME_MAX_LEN - 1);
+  strncpy(bleSettings.modelNumber,  BLE_DEFAULT_MODEL,        BLE_NAME_MAX_LEN - 1);
+  bleSettings.localName   [BLE_NAME_MAX_LEN - 1] = '\0';
+  bleSettings.manufacturer[BLE_NAME_MAX_LEN - 1] = '\0';
+  bleSettings.modelNumber [BLE_NAME_MAX_LEN - 1] = '\0';
+  bleSettings.txPower           = BLE_DEFAULT_TX_POWER;
+  bleSettings.advertisingEnabled = BLE_DEFAULT_ADVERTISING;
+  EEPROM.put(BLE_EEPROM_ADDR, bleSettings);
+  Serial.println("[BLE] Settings reset to defaults.");
+}
+
+void blePrintSettings() {
+  Serial.println("[BLE] --- Current Settings ---");
+  Serial.print  ("  Local name   : "); Serial.println(bleSettings.localName);
+  Serial.print  ("  Manufacturer : "); Serial.println(bleSettings.manufacturer);
+  Serial.print  ("  Model number : "); Serial.println(bleSettings.modelNumber);
+  Serial.print  ("  TX power     : "); Serial.print(bleSettings.txPower); Serial.println(" dBm");
+  Serial.print  ("  Advertising  : "); Serial.println(bleSettings.advertisingEnabled ? "ON" : "OFF");
+  Serial.println("[BLE] ----------------------------");
+}
+
+// ============================================
+// APPLY SETTINGS  (restarts BLE stack)
+// ============================================
+
+void bleApplySettings() {
+  // Disconnect any active central gracefully
+  BLEDevice central = BLE.central();
+  if (central && central.connected()) {
+    central.disconnect();
+    delay(200);
+  }
+
+  BLE.stopAdvertise();
+  BLE.end();
+  delay(100);
+
+  if (!BLE.begin()) {
+    Serial.println("[BLE] Failed to restart BLE after settings change!");
+    return;
+  }
+
+  BLE.setLocalName(bleSettings.localName);
+  BLE.setAdvertisedService(deviceInfoService);
+
+  // Rewrite characteristic values from new settings
+  manufacturerNameCharacteristic.writeValue(bleSettings.manufacturer);
+  modelNumberCharacteristic.writeValue(bleSettings.modelNumber);
+
+  // TX power — ArduinoBLE exposes this via BLE.setAdvertisingInterval as a
+  // workaround; direct power setting uses the underlying HCI command.
+  // On Arduino R4 WiFi / ESP32-based boards this maps to BLE.setTxPower().
+  // Uncomment the line below if your core supports it:
+  // BLE.setTxPower(bleSettings.txPower);
+
+  if (bleSettings.advertisingEnabled) {
+    BLE.advertise();
+    Serial.println("[BLE] Advertising restarted with new settings.");
+  } else {
+    Serial.println("[BLE] Advertising disabled by user setting.");
+  }
+
+  blePrintSettings();
+}
+
+// ============================================
+// INIT
 // ============================================
 
 void bluetoothInit() {
-  // Start BLE communication
+  // Load persisted settings (falls back to defaults if EEPROM is blank)
+  if (!bleLoadSettings()) {
+    Serial.println("[BLE] No saved settings — defaults applied.");
+  } else {
+    Serial.println("[BLE] Settings loaded from EEPROM.");
+  }
+  blePrintSettings();
+
   if (!BLE.begin()) {
-    Serial.println("[BLE] Failed to start BLE");
+    Serial.println("[BLE] Failed to start BLE!");
     while (1);
   }
 
-  // Set BLE local name and advertised service
-  BLE.setLocalName(BLE_LOCAL_NAME);
+  BLE.setLocalName(bleSettings.localName);
   BLE.setAdvertisedService(deviceInfoService);
 
-  // Add characteristics to service
   deviceInfoService.addCharacteristic(manufacturerNameCharacteristic);
   deviceInfoService.addCharacteristic(modelNumberCharacteristic);
   deviceInfoService.addCharacteristic(dataTxCharacteristic);
   deviceInfoService.addCharacteristic(dataRxCharacteristic);
 
-  // Set characteristic values
-  manufacturerNameCharacteristic.writeValue("Arduino R4 WiFi");
-  modelNumberCharacteristic.writeValue("URINE-TEST-001");
+  manufacturerNameCharacteristic.writeValue(bleSettings.manufacturer);
+  modelNumberCharacteristic.writeValue(bleSettings.modelNumber);
 
-  // Add service
   BLE.addService(deviceInfoService);
-
-  // Set event handler for data reception
   dataRxCharacteristic.setEventHandler(BLEWritten, onDataReceived);
 
-  // Start advertising
-  BLE.advertise();
-
-  Serial.println("[BLE] Bluetooth initialized and advertising");
-  Serial.print("[BLE] Local Name: ");
-  Serial.println(BLE_LOCAL_NAME);
-}
-
-void bluetoothUpdate() {
-  // Poll for BLE events
-  BLEDevice central = BLE.central();
-
-  if (central) {
-    if (!central.connected()) {
-      Serial.println("[BLE] Central disconnected");
-      return;
-    }
-
-    // Connection active - data is handled by event handlers
+  if (bleSettings.advertisingEnabled) {
+    BLE.advertise();
+    Serial.println("[BLE] Advertising started.");
   }
 }
+
+// ============================================
+// UPDATE
+// ============================================
+
+void bluetoothUpdate() {
+  BLEDevice central = BLE.central();
+  if (central && !central.connected()) {
+    Serial.println("[BLE] Central disconnected.");
+  }
+}
+
+// ============================================
+// SEND
+// ============================================
 
 void sendJsonData(const JsonDocument& jsonDoc) {
   if (!isBluetoothConnected()) {
-    Serial.println("[BLE] Not connected, cannot send JSON data");
+    Serial.println("[BLE] Not connected — cannot send.");
     return;
   }
-
-  // Serialize JSON to string
   String jsonString;
   serializeJson(jsonDoc, jsonString);
-
-  // Check size limit
   if (jsonString.length() > JSON_BUFFER_SIZE) {
-    Serial.println("[BLE] JSON data too large to send");
+    Serial.println("[BLE] Payload too large.");
     return;
   }
-
-  // Send via characteristic notification
   dataTxCharacteristic.writeValue(jsonString);
-  Serial.print("[BLE] Sent JSON: ");
-  Serial.println(jsonString);
+  Serial.print("[BLE] Sent: "); Serial.println(jsonString);
 }
 
 void sendMessage(const String& message) {
-  if (!isBluetoothConnected()) {
-    Serial.println("[BLE] Not connected, cannot send message");
-    return;
-  }
-
-  // Create a simple JSON wrapper for text messages
+  if (!isBluetoothConnected()) return;
   StaticJsonDocument<JSON_BUFFER_SIZE> doc;
   doc["type"] = "message";
   doc["data"] = message;
-
   sendJsonData(doc);
 }
 
+// ============================================
+// STATUS
+// ============================================
+
 bool isBluetoothConnected() {
   BLEDevice central = BLE.central();
-  return central.connected();
+  return central && central.connected();
 }
 
 JsonDocument getReceivedJson() {
@@ -124,29 +201,18 @@ JsonDocument getReceivedJson() {
 }
 
 // ============================================
-// EVENT HANDLERS
+// EVENT HANDLER
 // ============================================
 
 void onDataReceived(BLEDevice central, BLECharacteristic characteristic) {
   String receivedData = dataRxCharacteristic.value();
+  Serial.print("[BLE] Received: "); Serial.println(receivedData);
 
-  Serial.print("[BLE] Data received: ");
-  Serial.println(receivedData);
-
-  // Try to parse as JSON
   DeserializationError error = deserializeJson(lastReceivedJson, receivedData);
-
   if (error) {
-    Serial.print("[BLE] Failed to parse JSON: ");
-    Serial.println(error.c_str());
-
-    // Try to create a simple message structure if it fails
     lastReceivedJson.clear();
     lastReceivedJson["type"] = "raw_message";
     lastReceivedJson["data"] = receivedData;
-  } else {
-    Serial.println("[BLE] JSON parsed successfully");
   }
-
   hasNewData = true;
 }
