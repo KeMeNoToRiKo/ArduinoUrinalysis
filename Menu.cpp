@@ -8,6 +8,10 @@ void setMenu(Menu* newMenu) {
   cursorPos = 0;
 }
 
+Menu* getMenu() {
+  return currentMenu;
+}
+
 void menuUp() {
   if (!currentMenu) return;
   cursorPos--;

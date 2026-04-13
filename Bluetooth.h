@@ -25,7 +25,7 @@
 #define BLE_DEFAULT_TX_POWER      0       // dBm: -40, -20, -16, -12, -8, -4, 0, 4
 #define BLE_DEFAULT_ADVERTISING   true
 
-#define JSON_BUFFER_SIZE  256
+#define JSON_BUFFER_SIZE  512
 
 // ============================================
 // EEPROM LAYOUT

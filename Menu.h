@@ -21,6 +21,7 @@ struct Menu {
 extern int cursorPos;
 
 void setMenu(Menu* newMenu);
+Menu* getMenu();
 void drawMenu(U8G2 &u8g2);
 void menuUp();
 void menuDown();

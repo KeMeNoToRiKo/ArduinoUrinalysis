@@ -10,7 +10,7 @@ BLEService deviceInfoService(BLE_SERVICE_UUID);
 
 BLEStringCharacteristic manufacturerNameCharacteristic(DEVICE_INFO_CHAR_UUID,  BLERead,   BLE_NAME_MAX_LEN);
 BLEStringCharacteristic modelNumberCharacteristic     (DEVICE_MODEL_CHAR_UUID, BLERead,   BLE_NAME_MAX_LEN);
-BLEStringCharacteristic dataTxCharacteristic          (DATA_TX_CHAR_UUID,      BLENotify, JSON_BUFFER_SIZE);
+BLEStringCharacteristic dataTxCharacteristic          (DATA_TX_CHAR_UUID,      BLERead | BLENotify, JSON_BUFFER_SIZE);
 BLEStringCharacteristic dataRxCharacteristic          (DATA_RX_CHAR_UUID,      BLEWrite,  JSON_BUFFER_SIZE);
 
 StaticJsonDocument<JSON_BUFFER_SIZE> lastReceivedJson;
@@ -153,6 +153,8 @@ void bluetoothInit() {
 // ============================================
 
 void bluetoothUpdate() {
+  BLE.poll();   // flush TX notifications and process incoming events
+
   BLEDevice central = BLE.central();
   if (central && !central.connected()) {
     Serial.println("[BLE] Central disconnected.");
