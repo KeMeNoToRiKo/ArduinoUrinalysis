@@ -10,7 +10,9 @@
 #include "pHSensor.h"
 #include "colourSensor.h"
 #include "tdsSensor.h"
+#include "cameraSensor.h"
 #include <U8g2lib.h>
+#include <Wire.h>
 #include <ArduinoBLE.h>
 #include <ArduinoJson.h>
 
@@ -32,6 +34,7 @@ static bool inBTSettings = false;
 static bool inPHCal      = false;
 static bool inRGBCal     = false;
 static bool inTDSCal     = false;
+static bool inCameraCal  = false;
 
 // ============================================
 // FORWARD DECLARATIONS
@@ -54,6 +57,10 @@ void resetRGBCalibration();
 void openTDS();
 void openTDSCalibration();
 void resetTDSCalibration();
+// Camera (ESP32-CAM)
+void openCamera();
+void openCameraCalibration();
+void resetCameraCalibration();
 
 void openBluetoothSettings();
 
@@ -61,6 +68,7 @@ void openBluetoothSettings();
 void runCalibrationScreen();
 void runRGBCalibrationScreen();
 void runTDSCalibrationScreen();
+void runCameraCalibrationScreen();
 void runBluetoothSettingsScreen();
 
 // ============================================
@@ -92,9 +100,10 @@ Menu sensorsMenu = {
     {"pH Sensor",          openPH},
     {"RGB Sensor",         openRGB},
     {"TDS Sensor",         openTDS},
+    {"Camera Sensor",      openCamera},
     {"Back to Main Menu",  backToMain},
   },
-  4
+  5
 };
 
 Menu pHMenu = {
@@ -122,6 +131,16 @@ Menu TDSMenu = {
   {
     {"TDS Calibrate",      openTDSCalibration},
     {"TDS Cal Reset",      resetTDSCalibration},
+    {"Back to Main Menu",  backToMain},
+  },
+  3
+};
+
+Menu cameraMenu = {
+  "Camera Sensor",
+  {
+    {"Camera Calibrate",   openCameraCalibration},
+    {"Camera Cal Reset",   resetCameraCalibration},
     {"Back to Main Menu",  backToMain},
   },
   3
@@ -186,7 +205,7 @@ bool runTextEditor(const char* title, char* buffer, uint8_t maxLen) {
     if      (key == 2)  { charIdx = (charIdx - 1 + CHAR_SET_LEN) % CHAR_SET_LEN; }
     else if (key == 10) { charIdx = (charIdx + 1) % CHAR_SET_LEN; }
     else if (key == 15) {
-      if (strLen < maxLen - 2) {
+      if (strLen < maxLen - 1) {
         working[strLen++] = CHAR_SET[charIdx];
         working[strLen]   = '\0';
       }
@@ -275,12 +294,13 @@ void runTxPowerSelector() {
 //   0 — Advertising: ON / OFF  (toggle)
 //   1 — Name: <current name>   (text editor)
 //   2 — Advanced Settings      (opens advanced screen)
-//   3 — Back
+//
+// key8 navigates back at any time (shown in hint).
 //
 void runBluetoothAdvancedScreen();   // forward declaration
 
 void runBluetoothSettingsScreen() {
-  static const int N = 4;
+  static const int N = 3;
   int cursor = 0;
 
   while (true) {
@@ -290,8 +310,7 @@ void runBluetoothSettingsScreen() {
     u8g2.drawHLine(0, 12, 128);
 
     for (int i = 0; i < N; i++) {
-      int y = 26 + i * 12;
-      if (y > 63) break;
+      int y = 26 + i * 13;   // 13px spacing: items at y=26, 39, 52
 
       char line[32] = "";
       switch (i) {
@@ -299,7 +318,6 @@ void runBluetoothSettingsScreen() {
                          bleSettings.advertisingEnabled ? "ON" : "OFF");  break;
         case 1: snprintf(line, sizeof(line), "Name: %.12s", bleSettings.localName); break;
         case 2: snprintf(line, sizeof(line), "Advanced Settings");               break;
-        case 3: snprintf(line, sizeof(line), "[Back]");                          break;
       }
 
       if (i == cursor) {
@@ -312,7 +330,7 @@ void runBluetoothSettingsScreen() {
       }
     }
     u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.drawStr(0, 62, "UP/DN:move SEL:pick key8:back");
+    u8g2.drawStr(0, 63, "UP/DN:move SEL:pick key8:back");
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.sendBuffer();
 
@@ -337,9 +355,6 @@ void runBluetoothSettingsScreen() {
           runBluetoothAdvancedScreen();
           // After returning from advanced, stay in this simple screen
           break;
-        case 3:
-          setMenu(&settingsMenu);
-          return;
       }
 
       if (changed) {
@@ -710,6 +725,108 @@ void runTDSCalibrationScreen() {
 }
 
 // ============================================
+// CAMERA CALIBRATION SCREEN  (ESP32-CAM)
+// ============================================
+//
+// Two-step sequence: DARK → WHITE → DONE
+//
+// The ESP32-CAM does the actual frame capture, ROI averaging, and
+// persistence. This screen just drives the state machine and shows the
+// last raw averaged values so the operator can sanity-check the capture.
+//
+// Layout:
+//   y=10  Title
+//   y=12  Divider
+//   y=22  Step instruction
+//   y=34  Last captured RGB (or "live" hint while idle)
+//   y=46  Connection status
+//   y=58  Action hint
+//
+// Controls:
+//   SELECT (15)      — capture / confirm save
+//   UP/DN/key8       — cancel at any point
+//
+void runCameraCalibrationScreen() {
+  while (true) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 10, "-- Cam Calibration -");
+    u8g2.drawHLine(0, 12, 128);
+
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0, 22, camCalStepLabel());
+
+    char rgbBuf[24];
+    if (camLastCalR == 0 && camLastCalG == 0 && camLastCalB == 0) {
+      snprintf(rgbBuf, sizeof(rgbBuf), "Last: (none)");
+    } else {
+      snprintf(rgbBuf, sizeof(rgbBuf), "Last R:%u G:%u B:%u",
+               camLastCalR, camLastCalG, camLastCalB);
+    }
+    u8g2.drawStr(0, 34, rgbBuf);
+
+    u8g2.drawStr(0, 46, camOnline ? "ESP32-CAM: online" : "ESP32-CAM: OFFLINE");
+
+    if (camCalStep == CAM_CAL_DONE) {
+      u8g2.drawStr(0, 58, "SEL=Save  UP/DN=Cancel");
+    } else {
+      u8g2.drawStr(0, 58, "SEL=Capture UP/DN=Cncl");
+    }
+
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.sendBuffer();
+
+    int key = scanKey();
+
+    if (key == 15) {
+      if (camCalStep == CAM_CAL_DONE) {
+        camCalSave();
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(20, 32, "Cam Cal Saved!");
+        u8g2.sendBuffer();
+        delay(1500);
+        break;
+      } else {
+        // CAL_DARK / CAL_WHITE — this can take ~1 s on the ESP32 side
+        // (warmup frames + capture). Show a brief progress message.
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(16, 32, "Capturing...");
+        u8g2.sendBuffer();
+
+        camCalCapture();
+
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_6x10_tf);
+        if (camCalStep == CAM_CAL_WHITE) {
+          u8g2.drawStr(10, 32, "Dark captured!");
+        } else if (camCalStep == CAM_CAL_DONE) {
+          u8g2.drawStr(10, 32, "White captured!");
+        } else {
+          u8g2.drawStr(10, 32, "Capture failed.");
+        }
+        u8g2.sendBuffer();
+        delay(900);
+      }
+    } else if (key == 2 || key == 10 || key == 8) {
+      camCalCancel();
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(20, 32, "Cam Cal Cancelled");
+      u8g2.sendBuffer();
+      delay(1200);
+      break;
+    }
+
+    delay(80);
+  }
+
+  inCameraCal = false;
+  setMenu(&cameraMenu);
+}
+
+// ============================================
 // MENU ACTION CALLBACKS
 // ============================================
 
@@ -721,6 +838,15 @@ void startTest() {
   u8g2.drawHLine(0, 12, 128);
   u8g2.drawStr(16, 34, "Reading sensors...");
   u8g2.sendBuffer();
+
+  // ---- Notify connected central that a test has begun ----
+  if (isBluetoothConnected()) {
+    StaticJsonDocument<64> startDoc;
+    startDoc["device"] = DEVICE_NAME;
+    startDoc["type"]   = "test_started";
+    sendJsonData(startDoc);
+    BLE.poll();
+  }
 
   // ---- Collect all sensor data ----
   float temp = pHReadTemperature();
@@ -735,6 +861,14 @@ void startTest() {
 
   char hexColor[8];
   snprintf(hexColor, sizeof(hexColor), "#%02X%02X%02X", rgb.r, rgb.g, rgb.b);
+
+  // Camera (ESP32-CAM) — independent colour reading via image processing.
+  // Returns valid=false silently if the ESP32 isn't connected or fails.
+  CameraRGB cam = cameraRead();
+  char hexCam[8] = "";
+  if (cam.valid) {
+    snprintf(hexCam, sizeof(hexCam), "#%02X%02X%02X", cam.r, cam.g, cam.b);
+  }
 
   // ---- Serial log ----
   Serial.println("[Test] ===== New Test Result =====");
@@ -753,28 +887,45 @@ void startTest() {
   Serial.print("[Test] Color:   "); Serial.println(hexColor);
   Serial.print("[Test] Lux:     "); Serial.println(lux, 1);
   Serial.print("[Test] CCT:     "); Serial.print(cct); Serial.println(" K");
+  if (cam.valid) {
+    Serial.print("[Test] Cam   R="); Serial.print(cam.r);
+    Serial.print(" G=");              Serial.print(cam.g);
+    Serial.print(" B=");              Serial.println(cam.b);
+    Serial.print("[Test] CamHex: "); Serial.println(hexCam);
+  } else {
+    Serial.println("[Test] Cam:     (offline)");
+  }
   Serial.println("[Test] ==================================");
 
   // ---- Build JSON payload ----
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
 
   doc["device"]  = DEVICE_NAME;
   doc["version"] = DEVICE_VERSION;
   doc["type"]    = "urinalysis";
 
   JsonObject sensors = doc.createNestedObject("sensors");
-  sensors["temp_c"]   = serialized(String(temp, 1));
-  sensors["pH"]       = serialized(String(pH,   2));
-  sensors["tds_ppm"]  = serialized(String(tds,  0));
-  sensors["ec_us_cm"] = serialized(String(ec,   2));
+  sensors["temp_c"]   = temp;
+  sensors["pH"]       = pH;
+  sensors["tds_ppm"]  = tds;
+  sensors["ec_us_cm"] = ec;
 
   JsonObject color = sensors.createNestedObject("color");
   color["r"]   = rgb.r;
   color["g"]   = rgb.g;
   color["b"]   = rgb.b;
   color["hex"] = hexColor;
-  color["lux"] = serialized(String(lux, 1));
+  color["lux"] = lux;
   color["cct"] = cct;
+
+  // Camera (ESP32-CAM via UART) — only included if the read succeeded.
+  if (cam.valid) {
+    JsonObject camera = sensors.createNestedObject("camera");
+    camera["r"]   = cam.r;
+    camera["g"]   = cam.g;
+    camera["b"]   = cam.b;
+    camera["hex"] = hexCam;
+  }
 
   // ---- Auto-send via BLE if connected ----
   bool sent = false;
@@ -894,7 +1045,164 @@ void resetTDSCalibration() {
   setMenu(&TDSMenu);
 }
 
+void openCamera()             { setMenu(&cameraMenu); }
+void openCameraCalibration()  { camCalBegin(); inCameraCal = true; }
+
+void resetCameraCalibration() {
+  camCalResetToDefaults();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(8, 32, "Cam Cal reset to");
+  u8g2.drawStr(28, 44, "defaults.");
+  u8g2.sendBuffer();
+  delay(1500);
+  setMenu(&cameraMenu);
+}
+
 void openBluetoothSettings() { inBTSettings = true; }
+
+// ============================================
+// SETUP
+// ============================================
+
+// ============================================
+// BOOT LOADING SCREEN
+// ============================================
+//
+// Layout (128x64):
+//   y=10  Title: "-- Booting ----------"
+//   y=12  Divider
+//   y=22  Step label (current sensor being initialised)
+//   y=34  Status tag for just-completed step ("OK" / "WARN" / "FAILED")
+//   y=44  Progress bar outline + fill  (x=0..127, h=8, y=44..51)
+//   y=62  "Step N/N" counter
+//
+// The bar is drawn as an outline box on first call for each step, then
+// filled proportionally from the left as each step completes.
+// ============================================
+
+static const uint8_t BOOT_STEPS_TOTAL = 6;
+
+// Boot status tags (kept short for the small font)
+#define BOOT_OK     "OK"
+#define BOOT_WARN   "WARN"
+#define BOOT_FAIL   "FAILED"
+
+// Progress bar geometry
+static const int BAR_X  = 0;
+static const int BAR_Y  = 44;
+static const int BAR_W  = 127;
+static const int BAR_H  = 8;
+
+/**
+ * Draw a single boot-progress frame.
+ *
+ * @param stepLabel   Short description of the step currently running
+ *                    (shown mid-screen while the init is in progress).
+ * @param statusLabel Result of the PREVIOUS step: BOOT_OK, BOOT_WARN,
+ *                    BOOT_FAIL, or "" to hide.
+ * @param stepsCompleted  How many steps have finished (0..BOOT_STEPS_TOTAL).
+ */
+static void drawBootFrame(const char* stepLabel,
+                          const char* statusLabel,
+                          uint8_t stepsCompleted) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // Title
+  u8g2.drawStr(0, 10, "-- Booting ----------");
+  u8g2.drawHLine(0, 12, 128);
+
+  // Current step
+  u8g2.setFont(u8g2_font_5x7_tf);
+  u8g2.drawStr(0, 22, stepLabel);
+
+  // Previous step status (right-aligned feel: just draw after label)
+  if (statusLabel && statusLabel[0] != '\0') {
+    // Colour-code by result: invert box for FAIL/WARN, plain text for OK
+    if (strcmp(statusLabel, BOOT_OK) == 0) {
+      u8g2.drawStr(0, 34, "[OK]");
+    } else if (strcmp(statusLabel, BOOT_WARN) == 0) {
+      // Inverted box for WARN
+      u8g2.drawBox(0, 25, 40, 11);
+      u8g2.setDrawColor(0);
+      u8g2.drawStr(2, 34, "WARN");
+      u8g2.setDrawColor(1);
+    } else {
+      // Inverted box for FAIL
+      u8g2.drawBox(0, 25, 50, 11);
+      u8g2.setDrawColor(0);
+      u8g2.drawStr(2, 34, "FAILED");
+      u8g2.setDrawColor(1);
+    }
+  }
+
+  // Progress bar
+  u8g2.drawFrame(BAR_X, BAR_Y, BAR_W + 1, BAR_H);
+  if (stepsCompleted > 0) {
+    int fillW = (int)((long)BAR_W * stepsCompleted / BOOT_STEPS_TOTAL);
+    if (fillW > 0) {
+      u8g2.drawBox(BAR_X + 1, BAR_Y + 1, fillW, BAR_H - 2);
+    }
+  }
+
+  // Step counter
+  char counter[16];
+  snprintf(counter, sizeof(counter), "Step %u/%u",
+           (unsigned)stepsCompleted, (unsigned)BOOT_STEPS_TOTAL);
+  u8g2.drawStr(0, 62, counter);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.sendBuffer();
+}
+
+/**
+ * Show a fault-summary screen after booting with one or more failures.
+ * Lists each failed/warned sensor and waits for SELECT to continue.
+ *
+ * faultMask bits (LSB = step 0):
+ *   bit 0 = Keypad, bit 1 = Camera, bit 2 = BLE,
+ *   bit 3 = pH,     bit 4 = RGB,    bit 5 = TDS
+ * warnMask uses the same bit positions.
+ */
+static void showBootFaultSummary(uint8_t faultMask, uint8_t warnMask) {
+  // Build list of affected sensors
+  static const char* sensorNames[BOOT_STEPS_TOTAL] = {
+    "Keypad", "Camera", "BLE", "pH", "RGB", "TDS"
+  };
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 10, "-- Boot Warnings ----");
+  u8g2.drawHLine(0, 12, 128);
+
+  u8g2.setFont(u8g2_font_5x7_tf);
+  int y = 24;
+  for (int i = 0; i < BOOT_STEPS_TOTAL; i++) {
+    if ((faultMask >> i) & 1) {
+      char line[28];
+      snprintf(line, sizeof(line), "[FAIL] %s", sensorNames[i]);
+      u8g2.drawStr(0, y, line);
+      y += 10;
+      if (y > 54) break;
+    } else if ((warnMask >> i) & 1) {
+      char line[28];
+      snprintf(line, sizeof(line), "[WARN] %s", sensorNames[i]);
+      u8g2.drawStr(0, y, line);
+      y += 10;
+      if (y > 54) break;
+    }
+  }
+
+  u8g2.drawStr(0, 62, "SEL to continue");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.sendBuffer();
+
+  // Wait for SELECT
+  while (scanKey() != 15) {
+    delay(80);
+  }
+}
 
 // ============================================
 // SETUP
@@ -902,23 +1210,104 @@ void openBluetoothSettings() { inBTSettings = true; }
 
 void setup() {
   Serial.begin(9600);
-  u8g2.begin();
-  keypadInit();
-  bluetoothInit();
-  pHSensorInit();
-  colorSensorInit();
-  colorCalPrint();
-  tdsSensorInit();
 
+  // Display MUST come up before any other init so the loading screen works.
+  u8g2.begin();
+
+  // ---- SH1106 2-pixel column fix ----
+  // The SH1106 has 132 columns of GDDRAM but only displays 128.
+  // U8g2 maps framebuffer col 0 → hardware col 2, leaving hardware
+  // cols 0 and 1 unwritten. They retain power-on garbage and appear
+  // as two glitchy pixels on the left edge of the screen.
+  // Fix: write a single zero byte to each of those two columns on
+  // every page via raw I2C, once at startup.
+  {
+    const uint8_t SH1106_ADDR = 0x3C;
+    for (uint8_t page = 0; page < 8; page++) {
+      // Set page address, then column address = 0
+      Wire.beginTransmission(SH1106_ADDR);
+      Wire.write(0x00);           // control byte: command stream (Co=0, D/C#=0)
+      Wire.write(0xB0 | page);    // Set Page Address
+      Wire.write(0x00);           // Set Low Column Address  = 0
+      Wire.write(0x10);           // Set High Column Address = 0
+      Wire.endTransmission();
+      // Write 2 zero (black) bytes — clears hardware cols 0 and 1
+      Wire.beginTransmission(SH1106_ADDR);
+      Wire.write(0x40);           // control byte: data stream (Co=0, D/C#=1)
+      Wire.write(0x00);           // col 0 = all pixels off
+      Wire.write(0x00);           // col 1 = all pixels off
+      Wire.endTransmission();
+    }
+  }
+
+  // Keypad uses I2C (PCF8574); init early so scanKey() works in fault screen.
+  // ---- Step 1: Keypad ----
+  drawBootFrame("Keypad...", "", 0);
+  keypadInit();
+  // keypadInit() is void and will not fail silently — it just won't scan
+  // if the PCF8574 isn't present. We treat it as always-OK here; hardware
+  // faults surface as "no key response" at runtime.
+  uint8_t faultMask = 0;
+  uint8_t warnMask  = 0;
+  drawBootFrame("Camera...", BOOT_OK, 1);
+
+  // ---- Step 2: Camera (ESP32-CAM via UART) ----
+  // This step can take up to ~8 s (ESP32 cold-boot grace period).
+  // cameraSensorInit() does its own polling loop, so we just call it.
+  cameraSensorInit();
+  // camOnline is set by cameraSensorInit() — false means offline/not present.
+  // Camera is optional hardware; treat offline as WARN, not FAIL.
+  const char* camStatus = camOnline ? BOOT_OK : BOOT_WARN;
+  if (!camOnline) warnMask |= (1 << 1);
+  drawBootFrame("BLE...", camStatus, 2);
+
+  // ---- Step 3: BLE ----
+  bool bleOk = bluetoothInit();
+  if (!bleOk) faultMask |= (1 << 2);
+  drawBootFrame("pH Sensor...", bleOk ? BOOT_OK : BOOT_FAIL, 3);
+
+  // ---- Step 4: pH Sensor ----
+  pHSensorInit();
+  // pHSensorInit() is void; failure (no hardware) manifests as bad readings.
+  // It always falls back to EEPROM defaults so treat as OK for boot purposes.
+  drawBootFrame("RGB Sensor...", BOOT_OK, 4);
+
+  // ---- Step 5: RGB / Colour Sensor ----
+  bool colorOk = colorSensorInit();
+  colorCalPrint();
+  if (!colorOk) faultMask |= (1 << 4);
+  drawBootFrame("TDS Sensor...", colorOk ? BOOT_OK : BOOT_FAIL, 5);
+
+  // ---- Step 6: TDS Sensor ----
+  tdsSensorInit();
+  // Same as pH — void, defaults to EEPROM; treat as OK for boot.
+  drawBootFrame("Done.", BOOT_OK, 6);
+  delay(400);   // brief pause so user sees the completed bar
+
+  // ---- Fault summary ----
+  if (faultMask || warnMask) {
+    showBootFaultSummary(faultMask, warnMask);
+  }
+
+  // ---- Serial banner ----
   Serial.println("========================================");
-  Serial.print("Device: ");  Serial.println(DEVICE_NAME);
-  Serial.print("Type: ");    Serial.println(DEVICE_TYPE);
+  Serial.print("Device:  "); Serial.println(DEVICE_NAME);
+  Serial.print("Type:    "); Serial.println(DEVICE_TYPE);
   Serial.print("Version: "); Serial.println(DEVICE_VERSION);
+  if (faultMask) {
+    Serial.print("[Boot] FAULTS (mask=0x");
+    Serial.print(faultMask, HEX);
+    Serial.println(")");
+  }
+  if (warnMask) {
+    Serial.print("[Boot] WARNINGS (mask=0x");
+    Serial.print(warnMask, HEX);
+    Serial.println(")");
+  }
   Serial.println("System initialized");
   Serial.println("========================================");
 
   setMenu(&mainMenu);
-  delay(500);
 }
 
 // ============================================
@@ -941,6 +1330,11 @@ void loop() {
 
   if (inTDSCal) {
     runTDSCalibrationScreen();
+    return;
+  }
+
+  if (inCameraCal) {
+    runCameraCalibrationScreen();
     return;
   }
 
@@ -984,6 +1378,7 @@ void loop() {
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.sendBuffer();
   }
+
 
   int key = scanKey();
   switch (key) {

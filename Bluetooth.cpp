@@ -114,7 +114,7 @@ void bleApplySettings() {
 // INIT
 // ============================================
 
-void bluetoothInit() {
+bool bluetoothInit() {
   // Load persisted settings (falls back to defaults if EEPROM is blank)
   if (!bleLoadSettings()) {
     Serial.println("[BLE] No saved settings — defaults applied.");
@@ -125,7 +125,7 @@ void bluetoothInit() {
 
   if (!BLE.begin()) {
     Serial.println("[BLE] Failed to start BLE!");
-    while (1);
+    return false;
   }
 
   BLE.setLocalName(bleSettings.localName);
@@ -146,6 +146,7 @@ void bluetoothInit() {
     BLE.advertise();
     Serial.println("[BLE] Advertising started.");
   }
+  return true;
 }
 
 // ============================================
@@ -170,15 +171,30 @@ void sendJsonData(const JsonDocument& jsonDoc) {
     Serial.println("[BLE] Not connected — cannot send.");
     return;
   }
+
   String jsonString;
   serializeJson(jsonDoc, jsonString);
-  if (jsonString.length() > JSON_BUFFER_SIZE) {
-    Serial.println("[BLE] Payload too large.");
-    return;
+  Serial.print("[BLE] Sending ("); Serial.print(jsonString.length()); Serial.println(" bytes):");
+  Serial.println(jsonString);
+
+  // ArduinoBLE does not auto-chunk large notify payloads.
+  // Manually split into 20-byte packets so iOS receives everything.
+  const int chunkSize = 20;
+  int totalLength = jsonString.length();
+  int offset = 0;
+
+  while (offset < totalLength) {
+    int remaining = totalLength - offset;
+    int len = remaining < chunkSize ? remaining : chunkSize;
+    String chunk = jsonString.substring(offset, offset + len);
+    dataTxCharacteristic.writeValue(chunk);
+    offset += len;
+    delay(10); // give iOS time to process each notification
   }
-  dataTxCharacteristic.writeValue(jsonString);
-  Serial.print("[BLE] Sent: "); Serial.println(jsonString);
+
+  Serial.println("[BLE] Send complete.");
 }
+
 
 void sendMessage(const String& message) {
   if (!isBluetoothConnected()) return;

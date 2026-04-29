@@ -72,8 +72,9 @@ extern bool hasNewData;
 /**
  * Initialise BLE. Loads settings from EEPROM first; applies defaults
  * if no valid settings are found.
+ * @return true on success, false if the BLE hardware could not be started.
  */
-void bluetoothInit();
+bool bluetoothInit();
 
 /**
  * Poll BLE events. Call every loop iteration.
