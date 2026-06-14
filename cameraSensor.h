@@ -38,6 +38,32 @@
 #define CAM_READ_TIMEOUT_MS 4000   // capture + frame settle on ESP32 side
 #define CAM_CAL_TIMEOUT_MS  5000
 
+// ---- Illumination settle (ms) ----
+// The ESP32-CAM is lit by the EXTERNAL white LEDs, which are switched OFF while
+// the AS7341 reads and back ON for the camera (see startTest / the calibration
+// screens). The OV3660 runs auto-exposure and auto-white-balance, and after the
+// light changes it needs several frames to re-converge — capture too soon after
+// switching the LEDs on and the frame is exposed/white-balanced for the wrong
+// (darker) scene, skewing the colour.
+//
+// So after turning the external LEDs ON we wait CAM_LIGHT_SETTLE_MS BEFORE
+// sending the capture command, so the ESP32 begins its own warm-up frames from
+// an already-steady lit scene. This is much longer than the AS7341's
+// COLOR_FLASH_SETTLE_MS (the LEDs are electrically stable in <1 ms; this margin
+// is entirely for the camera's AEC/AWB to settle). Raise it if camera colours
+// still drift on the first read after the lights come on; lower it if the extra
+// latency per test/calibration matters more than that margin.
+#define CAM_LIGHT_SETTLE_MS  500
+
+// ---- READ robustness ----
+// A single READ failure (timeout OR a garbled/unparseable line) is not a
+// reliable signal that the camera is unavailable — the ESP32 may have just
+// recovered from a transient brownout, or a UART byte got mangled. Retry a
+// few times before declaring the camera offline, mirroring the PING-probe
+// philosophy in cameraSensorInit().
+#define CAM_READ_RETRIES        3      // READ attempts before giving up
+#define CAM_READ_RETRY_DELAY_MS 150    // backoff between attempts
+
 // ============================================
 // DATA STRUCTURES
 // ============================================

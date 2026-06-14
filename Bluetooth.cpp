@@ -71,7 +71,6 @@ void blePrintSettings() {
 // ============================================
 
 void bleApplySettings() {
-  // Disconnect any active central gracefully
   BLEDevice central = BLE.central();
   if (central && central.connected()) {
     central.disconnect();
@@ -87,18 +86,24 @@ void bleApplySettings() {
     return;
   }
 
+  BLE.setDeviceName(bleSettings.localName);
   BLE.setLocalName(bleSettings.localName);
   BLE.setAdvertisedService(deviceInfoService);
 
-  // Rewrite characteristic values from new settings
+  // Must re-add characteristics — BLE.end() deregisters them
+  deviceInfoService.addCharacteristic(manufacturerNameCharacteristic);
+  deviceInfoService.addCharacteristic(modelNumberCharacteristic);
+  deviceInfoService.addCharacteristic(dataTxCharacteristic);
+  deviceInfoService.addCharacteristic(dataRxCharacteristic);
+
   manufacturerNameCharacteristic.writeValue(bleSettings.manufacturer);
   modelNumberCharacteristic.writeValue(bleSettings.modelNumber);
 
-  // TX power — ArduinoBLE exposes this via BLE.setAdvertisingInterval as a
-  // workaround; direct power setting uses the underlying HCI command.
-  // On Arduino R4 WiFi / ESP32-based boards this maps to BLE.setTxPower().
-  // Uncomment the line below if your core supports it:
-  // BLE.setTxPower(bleSettings.txPower);
+  // Must re-add the service and re-register the RX handler
+  BLE.addService(deviceInfoService);
+  dataRxCharacteristic.setEventHandler(BLEWritten, onDataReceived);
+
+  // BLE.setTxPower(bleSettings.txPower); // uncomment if your core supports it
 
   if (bleSettings.advertisingEnabled) {
     BLE.advertise();
@@ -128,7 +133,8 @@ bool bluetoothInit() {
     return false;
   }
 
-  BLE.setLocalName(bleSettings.localName);
+  BLE.setDeviceName(bleSettings.localName);   // GAP Device Name — full name, read after connect
+  BLE.setLocalName(bleSettings.localName);    // Advertisement local name — may be truncated by stack
   BLE.setAdvertisedService(deviceInfoService);
 
   deviceInfoService.addCharacteristic(manufacturerNameCharacteristic);

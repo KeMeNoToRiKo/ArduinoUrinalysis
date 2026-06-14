@@ -19,7 +19,7 @@
 // DEFAULTS  (used when EEPROM has no valid data)
 // ============================================
 
-#define BLE_DEFAULT_NAME          "URINE-TEST-001"
+#define BLE_DEFAULT_NAME          "Arduino-Urino"
 #define BLE_DEFAULT_MANUFACTURER  "Arduino R4 WiFi"
 #define BLE_DEFAULT_MODEL         "URINE-TEST-001"
 #define BLE_DEFAULT_TX_POWER      0       // dBm: -40, -20, -16, -12, -8, -4, 0, 4

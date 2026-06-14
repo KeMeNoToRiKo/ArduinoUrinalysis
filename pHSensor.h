@@ -48,6 +48,27 @@
 // Adjusted for temperature: slope = 0.05916 * (T_K / 298.15)
 #define NERNST_SLOPE_25C  0.05916f   // V/pH at 25 °C
 
+// Isopotential point of an ideal pH probe.
+// At this pH the probe output voltage is (theoretically) independent
+// of temperature — it's the pivot around which the Nernst slope rotates.
+// For ammonium-phosphate buffer based glass electrodes this is very close
+// to pH 7.00, NOT the calibration midpoint (6.86) which is just a buffer
+// happens to be near neutral.
+#define PH_ISOPOTENTIAL  7.00f
+
+// ============================================
+// CALIBRATION STABILITY CHECK
+// ============================================
+//
+// During calCapture(), the probe is sampled over a window and the
+// capture is only accepted if the readings are stable enough.
+// Prevents capturing a calibration point while the probe is still
+// equilibrating, which is a common source of bad calibrations.
+//
+#define PH_CAL_STABILITY_WINDOW_MS    2000   // sample window length (ms)
+#define PH_CAL_STABILITY_SAMPLE_MS     100   // gap between samples in window
+#define PH_CAL_STABILITY_MAX_SPREAD   0.020f // max peak-to-peak (V) to accept
+
 // ============================================
 // DATA STRUCTURES
 // ============================================
@@ -123,15 +144,29 @@ InterpolationMode getInterpolationMode();
 void pHSensorInit();
 
 /**
- * Read the raw ADC voltage from the pH probe (averaged).
+ * Read the raw ADC voltage from the pH probe (median-filtered).
+ *
+ * Uses a median filter rather than a mean: the high-impedance pH probe
+ * picks up mains hum and the occasional ESD spike. A single outlier in
+ * a small sample window can shift the mean by tens of millivolts; the
+ * median rejects it cleanly. Same approach the TDS module uses.
+ *
  * @return Voltage in volts (0–5 V or 0–3.3 V depending on board)
  */
 float pHReadVoltage();
 
 /**
  * Convert a raw voltage to a pH value using the current calibration.
- * Applies a piecewise-linear interpolation across the three cal points
- * and a simple temperature-compensation correction.
+ *
+ * Algorithm:
+ *   1. Compensate the input voltage for sample temperature, pivoting
+ *      around the probe's isopotential point (PH_ISOPOTENTIAL ≈ pH 7).
+ *      This produces an equivalent voltage as if the sample were at 25 °C.
+ *   2. Interpolate the compensated voltage through the 3 stored
+ *      calibration points (Lagrange quadratic by default, falling back
+ *      to piecewise linear outside the calibrated range to avoid the
+ *      polynomial-edge-curl problem).
+ *   3. Clamp to [0, 14].
  *
  * @param voltage     Raw probe voltage in volts
  * @param temperature Measured temperature in °C (default 25.0)
@@ -162,10 +197,19 @@ void calBegin();
 
 /**
  * Capture the current probe reading for the active calibration step.
- * Call once per step after the probe has stabilised in the buffer.
- * Advances calStep automatically.
+ *
+ * Performs a stability check: samples the probe over
+ * PH_CAL_STABILITY_WINDOW_MS and only accepts the capture if the
+ * peak-to-peak spread is below PH_CAL_STABILITY_MAX_SPREAD volts.
+ * If unstable, the function returns without advancing the state machine
+ * and prints a warning — the user should wait longer for the probe to
+ * equilibrate and try again.
+ *
+ * Advances calStep on success.
+ *
+ * @return true if a stable reading was captured, false if rejected.
  */
-void calCapture();
+bool calCapture();
 
 /**
  * Save the completed calibration to EEPROM.

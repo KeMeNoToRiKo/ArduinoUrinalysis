@@ -1,78 +1,74 @@
 // ============================================
-// KEYPAD — PCF8574 I2C driver
+// KEYPAD — Direct GPIO driver (4×4 matrix)
 // ============================================
-// Replaces the direct-GPIO driver with one that
-// communicates through a PCF8574 I/O expander.
+// Drives a 4×4 matrix keypad using eight Arduino
+// digital pins — no I2C expander required.
 //
-// The public API (keypadInit / scanKey) is kept
-// identical to the original so no call-site changes
-// are needed in the rest of the project.
-//
-// PCF8574 I/O bit layout (one byte, 8 bits):
-//
-//   Bit:  7    6    5    4    3    2    1    0
-//         C4   C3   C2   C1   R4   R3   R2   R1
-//
-//   Rows  → lower nibble (bits 3:0), active-LOW output
-//   Cols  → upper nibble (bits 7:4), INPUT with pull-ups
-//              (PCF8574 outputs written HIGH act as
-//               weak pull-up inputs — no external
-//               resistors needed on column lines)
+// Scan algorithm (standard row-scan):
+//   For each row:
+//     1. Drive row pin LOW (all others HIGH / INPUT).
+//     2. Read all four column pins (INPUT_PULLUP).
+//     3. A LOW column reading means that key is pressed.
+//     4. Debounce with a 20 ms re-read; wait for release
+//        before returning so each press is reported once.
 // ============================================
 
 #include "Keypad.h"
-#include <Wire.h>
 
 // --------------------------------------------------
 // Constants
 // --------------------------------------------------
 
-// Idle state: all rows HIGH (not driving), all cols HIGH (pulled up)
-static const uint8_t IDLE_BYTE = 0xFF;
-
-// Row-drive bytes — one row pulled LOW at a time, cols remain HIGH
-// Bit layout: [C4 C3 C2 C1 R4 R3 R2 R1]
-static const uint8_t ROW_SELECT[4] = {
-  0xFE,   // R1 LOW: 1111 1110
-  0xFD,   // R2 LOW: 1111 1101
-  0xFB,   // R3 LOW: 1111 1011
-  0xF7,   // R4 LOW: 1111 0111
-};
-
-// Column bit masks in the upper nibble
-static const uint8_t COL_MASK[4] = {
-  0x10,   // C1 = bit 4
-  0x20,   // C2 = bit 5
-  0x40,   // C3 = bit 6
-  0x80,   // C4 = bit 7
-};
-
 static const int NUM_ROWS = 4;
 static const int NUM_COLS = 4;
+
+static const uint8_t ROW_PINS[NUM_ROWS] = {
+  KEYPAD_ROW1_PIN,   // Row 1
+  KEYPAD_ROW2_PIN,   // Row 2
+  KEYPAD_ROW3_PIN,   // Row 3
+  KEYPAD_ROW4_PIN,   // Row 4
+};
+
+static const uint8_t COL_PINS[NUM_COLS] = {
+  KEYPAD_COL1_PIN,   // Col 1
+  KEYPAD_COL2_PIN,   // Col 2
+  KEYPAD_COL3_PIN,   // Col 3
+  KEYPAD_COL4_PIN,   // Col 4
+};
 
 // --------------------------------------------------
 // Internal helpers
 // --------------------------------------------------
 
 /**
- * Write one byte to the PCF8574.
- * Returns true on success.
+ * Set all row pins to INPUT (high-impedance / pulled up via external
+ * resistor or just floating high). This is the idle state between scans
+ * so no row actively pulls the column lines down.
  */
-static bool pcfWrite(uint8_t data) {
-  Wire.beginTransmission(PCF8574_ADDR);
-  Wire.write(data);
-  return (Wire.endTransmission() == 0);
+static void allRowsIdle() {
+  for (int r = 0; r < NUM_ROWS; r++) {
+    digitalWrite(ROW_PINS[r], HIGH);
+    pinMode(ROW_PINS[r], INPUT_PULLUP);
+  }
 }
 
 /**
- * Read one byte from the PCF8574.
- * On I2C error returns IDLE_BYTE (safe "no key" value).
+ * Drive one row LOW while all others remain idle (INPUT_PULLUP).
+ * Column pins then read LOW only if a key in that row is pressed.
  */
-static uint8_t pcfRead() {
-  if (Wire.requestFrom((uint8_t)PCF8574_ADDR, (uint8_t)1) != 1) {
-    return IDLE_BYTE;
-  }
-  return Wire.read();
+static void driveRow(int r) {
+  // First return all rows to idle so only one is ever driven LOW.
+  allRowsIdle();
+  pinMode(ROW_PINS[r], OUTPUT);
+  digitalWrite(ROW_PINS[r], LOW);
+}
+
+/**
+ * Read the column state while a row is being driven.
+ * Returns true if the given column reads LOW (key pressed).
+ */
+static bool colPressed(int c) {
+  return (digitalRead(COL_PINS[c]) == LOW);
 }
 
 // --------------------------------------------------
@@ -80,68 +76,55 @@ static uint8_t pcfRead() {
 // --------------------------------------------------
 
 /**
- * Initialise I2C and put the PCF8574 into its idle state.
+ * Initialise all keypad pins.
+ *   Row pins → INPUT_PULLUP (idle; driven LOW one at a time during scan)
+ *   Col pins → INPUT_PULLUP (HIGH when open, pulled LOW by row when pressed)
  * Call once from setup().
- *
- * Note: Wire.begin() is safe to call even if the OLED or
- * another peripheral has already called it — the Arduino
- * Wire library ignores duplicate begin() calls.
  */
 void keypadInit() {
-  Wire.begin();
-  pcfWrite(IDLE_BYTE);   // all pins HIGH → rows floating, cols pulled up
+  for (int r = 0; r < NUM_ROWS; r++) {
+    pinMode(ROW_PINS[r], INPUT_PULLUP);
+    digitalWrite(ROW_PINS[r], HIGH);
+  }
+  for (int c = 0; c < NUM_COLS; c++) {
+    pinMode(COL_PINS[c], INPUT_PULLUP);
+  }
 }
 
 /**
  * Scan the 4×4 matrix and return the pressed key (1–16),
  * or 0 if no key is down.
  *
- * Key numbering:
- *   Row 1: 1  2  3  4
- *   Row 2: 5  6  7  8
- *   Row 3: 9 10 11 12
- *   Row 4: 13 14 15 16
- *
- * Identical numbering to the original GPIO driver, so all
- * call-sites in the project work without modification.
+ * Each key is debounced with a 20 ms re-sample. The function blocks
+ * until the key is released so every press is reported exactly once.
  */
 int scanKey() {
   for (int r = 0; r < NUM_ROWS; r++) {
-
-    // Drive this row LOW, leave everything else HIGH
-    pcfWrite(ROW_SELECT[r]);
-    delayMicroseconds(50);   // allow signal to settle before reading
-
-    uint8_t state = pcfRead();
-
-    // Restore idle before processing so the bus is clean
-    pcfWrite(IDLE_BYTE);
+    driveRow(r);
+    delayMicroseconds(50);   // let the driven row settle before reading
 
     for (int c = 0; c < NUM_COLS; c++) {
-      // A LOW column bit means that key is pressed
-      if ((state & COL_MASK[c]) == 0) {
-
-        // Debounce: re-drive and re-read after 20 ms
+      if (colPressed(c)) {
+        // ---- Debounce: re-sample after 20 ms ----
         delay(20);
-        pcfWrite(ROW_SELECT[r]);
+        driveRow(r);
         delayMicroseconds(50);
-        uint8_t confirm = pcfRead();
-        pcfWrite(IDLE_BYTE);
 
-        if ((confirm & COL_MASK[c]) == 0) {
-          // Key confirmed — wait for release before returning
+        if (colPressed(c)) {
+          // Key confirmed — wait for release before returning.
           while (true) {
+            allRowsIdle();
             delay(5);
-            pcfWrite(ROW_SELECT[r]);
+            driveRow(r);
             delayMicroseconds(50);
-            uint8_t released = pcfRead();
-            pcfWrite(IDLE_BYTE);
-            if (released & COL_MASK[c]) break;  // bit gone HIGH → released
+            if (!colPressed(c)) break;   // gone HIGH → released
           }
+          allRowsIdle();   // leave pins tidy on exit
           return r * NUM_COLS + c + 1;
         }
       }
     }
+    allRowsIdle();   // restore before scanning next row
   }
-  return 0;  // no key pressed
+  return 0;   // no key pressed
 }

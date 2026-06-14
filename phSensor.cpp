@@ -37,14 +37,32 @@ void pHSensorInit() {
 // READING
 // ============================================
 
+/**
+ * Median-of-N helper. In-place insertion sort then return middle element.
+ * For small N (PH_SAMPLE_COUNT = 10) insertion sort is faster than any
+ * partial-sort cleverness and uses no heap.
+ */
+static float medianOfPH(float* arr, int n) {
+  for (int i = 1; i < n; i++) {
+    float key = arr[i];
+    int j = i - 1;
+    while (j >= 0 && arr[j] > key) {
+      arr[j + 1] = arr[j];
+      j--;
+    }
+    arr[j + 1] = key;
+  }
+  if (n % 2 == 1) return arr[n / 2];
+  return (arr[n / 2 - 1] + arr[n / 2]) * 0.5f;
+}
+
 float pHReadVoltage() {
-  long sum = 0;
+  float samples[PH_SAMPLE_COUNT];
   for (int i = 0; i < PH_SAMPLE_COUNT; i++) {
-    sum += analogRead(PH_SENSOR_PIN);
+    samples[i] = analogRead(PH_SENSOR_PIN) * (ADC_REF_VOLTAGE / ADC_MAX);
     delay(PH_SAMPLE_DELAY);
   }
-  float avgADC = (float)sum / PH_SAMPLE_COUNT;
-  return avgADC * (ADC_REF_VOLTAGE / ADC_MAX);
+  return medianOfPH(samples, PH_SAMPLE_COUNT);
 }
 
 // Active interpolation mode (change via setInterpolationMode())
@@ -118,14 +136,68 @@ static float lagrangePolynomial(float voltage,
 // ---- Public conversion function ----
 
 /**
- * Convert a raw probe voltage to pH using the active interpolation mode,
- * then apply a Nernst temperature compensation correction.
+ * Find the calibration voltage corresponding to the isopotential pH (~7.00).
+ *
+ * The probe's isopotential point is where output voltage is independent
+ * of temperature. We don't directly measure it; we estimate it from the
+ * three calibration points by interpolating the voltage at PH_ISOPOTENTIAL
+ * using the same Lagrange polynomial we use for pH lookup, but in reverse
+ * (pH → voltage rather than voltage → pH).
+ *
+ * This is computed once per call to voltageToPH() rather than cached so
+ * that re-calibration takes effect immediately without a separate refresh.
+ */
+static float computeIsoVoltage() {
+  // Lagrange interpolation in (pH, voltage) space at point pH = ISO
+  float pL = calData.low.pH,  vL = calData.low.voltage;
+  float pM = calData.mid.pH,  vM = calData.mid.voltage;
+  float pH_ = calData.high.pH, vH = calData.high.voltage;
+  float P  = PH_ISOPOTENTIAL;
+
+  float d0 = (pL - pM) * (pL - pH_);
+  float d1 = (pM - pL) * (pM - pH_);
+  float d2 = (pH_ - pL) * (pH_ - pM);
+
+  if (fabsf(d0) < 1e-6f || fabsf(d1) < 1e-6f || fabsf(d2) < 1e-6f) {
+    return vM;   // safe fallback: assume iso voltage ≈ mid-buffer voltage
+  }
+
+  return vL  * ((P - pM) * (P - pH_)) / d0
+       + vM  * ((P - pL) * (P - pH_)) / d1
+       + vH  * ((P - pL) * (P - pM))  / d2;
+}
+
+/**
+ * Convert a raw probe voltage to pH.
+ *
+ * Step 1: Temperature-compensate the voltage IN VOLTAGE SPACE around the
+ *         isopotential point. The Nernst slope scales as T_K/298.15, so a
+ *         given voltage deviation from V_iso corresponds to a smaller pH
+ *         deviation at higher T. We rescale the voltage so the subsequent
+ *         interpolation (which encodes the 25 °C-equivalent calibration
+ *         curve) sees the "as if at 25 °C" voltage.
+ *
+ *           V_25 = V_iso + (V - V_iso) / (T_K / 298.15)
+ *
+ *         Note: this relies on the calibration having been performed at
+ *         (or near) 25 °C, which is the assumption every pH module datasheet
+ *         makes for its three-point calibration procedure.
+ *
+ * Step 2: Interpolate. Lagrange quadratic inside the calibrated range,
+ *         linear extension outside (Lagrange extrapolation curls badly).
+ *
+ * Step 3: Clamp to [0, 14].
  */
 float voltageToPH(float voltage, float temperature) {
-  // Temperature compensation factor (ratio of actual to 25 °C Nernst slope)
+  // ---- Step 1: temperature compensation in voltage space ----
   float tempKelvin = temperature + 273.15f;
-  float tempFactor = tempKelvin / 298.15f;   // 1.0 at 25 °C
+  float tempFactor = tempKelvin / 298.15f;     // 1.0 at 25 °C
+  if (tempFactor < 0.5f) tempFactor = 0.5f;    // sanity floor (-136 °C!)
 
+  float vIso     = computeIsoVoltage();
+  float voltage25 = vIso + (voltage - vIso) / tempFactor;
+
+  // ---- Step 2: interpolation ----
   float vLow  = calData.low.voltage;
   float vMid  = calData.mid.voltage;
   float vHigh = calData.high.voltage;
@@ -133,18 +205,49 @@ float voltageToPH(float voltage, float temperature) {
   float pMid  = calData.mid.pH;
   float pHigh = calData.high.pH;
 
+  // For typical glass probes voltage DECREASES as pH rises, so the
+  // calibration order in voltage space is vLow > vMid > vHigh. Determine
+  // the inside/outside region by comparing against the extreme cal voltages.
+  float vMin = fminf(vLow, vHigh);
+  float vMax = fmaxf(vLow, vHigh);
+
   float pH;
 
-  if (interpMode == INTERP_LAGRANGE) {
-    pH = lagrangePolynomial(voltage, vLow, pLow, vMid, pMid, vHigh, pHigh);
+  if (voltage25 >= vMin && voltage25 <= vMax) {
+    // Inside calibrated range — use chosen interpolation mode.
+    if (interpMode == INTERP_LAGRANGE) {
+      pH = lagrangePolynomial(voltage25, vLow, pLow, vMid, pMid, vHigh, pHigh);
+    } else {
+      pH = piecewiseLinear(voltage25, vLow, pLow, vMid, pMid, vHigh, pHigh);
+    }
   } else {
-    pH = piecewiseLinear(voltage, vLow, pLow, vMid, pMid, vHigh, pHigh);
+    // Outside calibrated range — linear extension of the nearest segment.
+    // Lagrange extrapolation curls aggressively and can even go non-
+    // monotonic, so we never use it past the cal points.
+    if (vLow > vHigh) {
+      // Standard probe orientation: high V = low pH
+      if (voltage25 > vLow) {
+        // Below pH_LOW — extend the low/mid line
+        float slope = (pMid - pLow) / (vMid - vLow);
+        pH = pLow + slope * (voltage25 - vLow);
+      } else {
+        // Above pH_HIGH — extend the mid/high line
+        float slope = (pHigh - pMid) / (vHigh - vMid);
+        pH = pHigh + slope * (voltage25 - vHigh);
+      }
+    } else {
+      // Inverted orientation (rare, but support it). Mirror logic.
+      if (voltage25 < vLow) {
+        float slope = (pMid - pLow) / (vMid - vLow);
+        pH = pLow + slope * (voltage25 - vLow);
+      } else {
+        float slope = (pHigh - pMid) / (vHigh - vMid);
+        pH = pHigh + slope * (voltage25 - vHigh);
+      }
+    }
   }
 
-  // Temperature compensation: scale deviation from the neutral midpoint
-  // pH_corrected = pMid + (pH_raw - pMid) / tempFactor
-  pH = pMid + (pH - pMid) / tempFactor;
-
+  // ---- Step 3: clamp ----
   return constrain(pH, 0.0f, 14.0f);
 }
 
@@ -176,8 +279,60 @@ void calBegin() {
   Serial.println("[pH] Calibration started. Place probe in pH 4.00 buffer.");
 }
 
-void calCapture() {
-  float v = pHReadVoltage();
+/**
+ * Sample the probe over PH_CAL_STABILITY_WINDOW_MS and report:
+ *   - the median voltage across the window
+ *   - the peak-to-peak spread (max - min) across the window
+ *
+ * If the spread is large, the probe hasn't equilibrated yet and the
+ * caller should refuse to capture.
+ */
+static void measureStability(float& median, float& spread) {
+  const int N = PH_CAL_STABILITY_WINDOW_MS / PH_CAL_STABILITY_SAMPLE_MS;
+  // N is at most ~20 for the default 2 s / 100 ms settings — fine on stack.
+  float buf[N];
+  for (int i = 0; i < N; i++) {
+    // Each sample is itself a median of PH_SAMPLE_COUNT raw reads, so
+    // we get robust filtering at two levels: in-sample noise rejection
+    // here, and across-sample equilibration detection in the caller.
+    buf[i] = pHReadVoltage();
+    if (i < N - 1) delay(PH_CAL_STABILITY_SAMPLE_MS);
+  }
+
+  // Min / max across the window
+  float vMin = buf[0], vMax = buf[0];
+  for (int i = 1; i < N; i++) {
+    if (buf[i] < vMin) vMin = buf[i];
+    if (buf[i] > vMax) vMax = buf[i];
+  }
+  spread = vMax - vMin;
+
+  median = medianOfPH(buf, N);
+}
+
+bool calCapture() {
+  if (calStep != CAL_LOW && calStep != CAL_MID && calStep != CAL_HIGH) {
+    if (calStep == CAL_DONE) {
+      Serial.println("[pH] Already done — call calSave() or calBegin() to restart.");
+    } else {
+      Serial.println("[pH] calCapture() called outside calibration sequence.");
+    }
+    return false;
+  }
+
+  float v, spread;
+  measureStability(v, spread);
+
+  Serial.print("[pH] Stability: spread = ");
+  Serial.print(spread * 1000.0f, 1);
+  Serial.println(" mV over window.");
+
+  if (spread > PH_CAL_STABILITY_MAX_SPREAD) {
+    Serial.print("[pH] REJECTED: probe not stable (need <");
+    Serial.print(PH_CAL_STABILITY_MAX_SPREAD * 1000.0f, 0);
+    Serial.println(" mV). Wait for equilibration and retry.");
+    return false;
+  }
 
   switch (calStep) {
     case CAL_LOW:
@@ -187,7 +342,7 @@ void calCapture() {
       Serial.println(v, 4);
       Serial.println("[pH] Place probe in pH 6.86 buffer.");
       calStep = CAL_MID;
-      break;
+      return true;
 
     case CAL_MID:
       calData.mid.voltage = v;
@@ -196,7 +351,7 @@ void calCapture() {
       Serial.println(v, 4);
       Serial.println("[pH] Place probe in pH 9.18 buffer.");
       calStep = CAL_HIGH;
-      break;
+      return true;
 
     case CAL_HIGH:
       calData.high.voltage = v;
@@ -205,15 +360,10 @@ void calCapture() {
       Serial.println(v, 4);
       Serial.println("[pH] All points captured. Call calSave() to store.");
       calStep = CAL_DONE;
-      break;
-
-    case CAL_DONE:
-      Serial.println("[pH] Already done — call calSave() or calBegin() to restart.");
-      break;
+      return true;
 
     default:
-      Serial.println("[pH] calCapture() called outside calibration sequence.");
-      break;
+      return false;   // unreachable, silences warning
   }
 }
 

@@ -179,22 +179,39 @@ CameraRGB cameraRead() {
   if (!camOnline && !cameraIsReady()) return out;
 
   char buf[64];
-  if (!sendCommand("READ", buf, sizeof(buf), CAM_READ_TIMEOUT_MS)) {
-    Serial.println("[Cam] READ timed out.");
-    camOnline = false;
-    return out;
-  }
 
-  unsigned int r, g, b;
-  if (sscanf(buf, "RGB,%u,%u,%u", &r, &g, &b) == 3) {
-    out.r = (uint8_t)(r > 255 ? 255 : r);
-    out.g = (uint8_t)(g > 255 ? 255 : g);
-    out.b = (uint8_t)(b > 255 ? 255 : b);
-    out.valid = true;
-  } else {
-    Serial.print("[Cam] Unexpected READ response: ");
+  // Retry the READ a few times before declaring failure. A timeout AND a
+  // garbled (non-parsing) line both trigger a retry, so a one-off corrupted
+  // response gets another shot at a clean frame instead of returning a bad
+  // colour or zeroing out the camera on a transient glitch.
+  for (uint8_t attempt = 0; attempt < CAM_READ_RETRIES; attempt++) {
+    if (attempt > 0) delay(CAM_READ_RETRY_DELAY_MS);
+
+    if (!sendCommand("READ", buf, sizeof(buf), CAM_READ_TIMEOUT_MS)) {
+      Serial.print("[Cam] READ timed out (");
+      Serial.print(attempt + 1); Serial.print('/');
+      Serial.print(CAM_READ_RETRIES); Serial.println(").");
+      continue;
+    }
+
+    unsigned int r, g, b;
+    if (sscanf(buf, "RGB,%u,%u,%u", &r, &g, &b) == 3) {
+      out.r = (uint8_t)(r > 255 ? 255 : r);
+      out.g = (uint8_t)(g > 255 ? 255 : g);
+      out.b = (uint8_t)(b > 255 ? 255 : b);
+      out.valid = true;
+      return out;
+    }
+
+    Serial.print("[Cam] Unexpected READ response (");
+    Serial.print(attempt + 1); Serial.print('/');
+    Serial.print(CAM_READ_RETRIES); Serial.print("): ");
     Serial.println(buf);
   }
+
+  // Every attempt failed — mark offline so the next call re-probes from
+  // scratch (PING) before attempting another READ.
+  camOnline = false;
   return out;
 }
 
